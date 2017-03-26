@@ -39,7 +39,7 @@ args = get_args()
 flaskDb = FlaskDB()
 cache = TTLCache(maxsize=100, ttl=60 * 5)
 
-db_schema_version = 16
+db_schema_version = 17
 
 
 class MyRetryDB(RetryOperationalError, PooledMySQLDatabase):
@@ -446,11 +446,22 @@ class Pokestop(BaseModel):
     def get_stops(swLat, swLng, neLat, neLng, timestamp=0, oSwLat=None,
                   oSwLng=None, oNeLat=None, oNeLng=None, lured=False):
 
-        query = Pokestop.select(Pokestop.active_fort_modifier,
-                                Pokestop.enabled, Pokestop.latitude,
-                                Pokestop.longitude, Pokestop.last_modified,
-                                Pokestop.lure_expiration, Pokestop.pokestop_id)
-
+        query = (Pokestop
+                     .select(Pokestop.pokestop_id, Pokestop.enabled, Pokestop.latitude, Pokestop.longitude, Pokestop.last_modified, Pokestop.lure_expiration,
+                             Pokestop.active_fort_modifier, PokestopDetails.name, PokestopDetails.description, PokestopDetails.image_url)
+                     .join(PokestopDetails, JOIN.LEFT_OUTER, on=(PokestopDetails.pokestop_id == Pokestop.pokestop_id))           
+                     .dicts())
+        else:
+            query = (Pokestop
+                     .select(Pokestop.pokestop_id, Pokestop.enabled, Pokestop.latitude, Pokestop.longitude, Pokestop.last_modified, Pokestop.lure_expiration,
+                             Pokestop.active_fort_modifier, PokestopDetails.name, PokestopDetails.description, PokestopDetails.image_url)
+                     .join(PokestopDetails, JOIN.LEFT_OUTER, on=(PokestopDetails.pokestop_id == Pokestop.pokestop_id))
+                     .where((Pokestop.latitude >= swLat) &
+                            (Pokestop.longitude >= swLng) &
+                            (Pokestop.latitude <= neLat) &
+                            (Pokestop.longitude <= neLng))
+                     .dicts())
+					 
         if not (swLat and swLng and neLat and neLng):
             query = (query
                      .dicts())
@@ -1670,7 +1681,14 @@ class Token(flaskDb.Model):
 
         return tokens
 
-
+class PokestopDetails(BaseModel):
+     pokestop_id = CharField(primary_key=True, index=True, max_length=50)
+     name = CharField()
+     description = TextField(null=True, default="")
+     image_url = TextField(null=True, default="")
+     last_scanned = DateTimeField(default=datetime.utcnow)
+ 
+ 
 def hex_bounds(center, steps=None, radius=None):
     # Make a box that is (70m * step_limit * 2) + 70m away from the
     # center point.  Rationale is that you need to travel.
@@ -1741,6 +1759,7 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
             return {
                 'count': 0,
                 'gyms': gyms,
+				'pokestops': pokestops,
                 'spawn_points': spawn_points,
                 'bad_scan': True
             }
@@ -2236,7 +2255,28 @@ def parse_gyms(args, gym_responses, wh_update_queue, db_update_queue):
              len(gym_details),
              len(gym_members))
 
-
+def parse_pokestops(args, pokestop_responses):
+     pokestop_infos = {}
+ 
+     for p in pokestop_responses.values():
+         p_id = p['fort_id']
+         p_img = p['image_urls'][0].replace('http://', '').replace('https://', '')
+         pokestop_infos[p_id] = {
+             'pokestop_id': p_id,
+             'name': p['name'],
+             'description': p.get('description'),
+             'image_url': p_img,
+             'last_scanned': datetime.utcnow()
+         }
+ 
+     if len(pokestop_infos):
+         bulk_upsert(PokestopDetails, pokestop_infos)
+ 
+     log.info('Upserted %d pokestop infos',
+              len(pokestop_infos))
+ 
+ 
+ 
 def db_updater(args, q, db):
     # The forever loop.
     while True:
@@ -2377,7 +2417,7 @@ def bulk_upsert(cls, data, db):
 def create_tables(db):
     db.connect()
     verify_database_schema(db)
-    db.create_tables([Pokemon, Pokestop, Gym, ScannedLocation, GymDetails,
+    db.create_tables([Pokemon, Pokestop, PokestopDetails, Gym, ScannedLocation, GymDetails,
                       GymMember, GymPokemon, Trainer, MainWorker, WorkerStatus,
                       SpawnPoint, ScanSpawnPoint, SpawnpointDetectionData,
                       Token, LocationAltitude], safe=True)
@@ -2386,7 +2426,7 @@ def create_tables(db):
 
 def drop_tables(db):
     db.connect()
-    db.drop_tables([Pokemon, Pokestop, Gym, ScannedLocation, Versions,
+    db.drop_tables([Pokemon, Pokestop, PokestopDetails, Gym, ScannedLocation, Versions,
                     GymDetails, GymMember, GymPokemon, Trainer, MainWorker,
                     WorkerStatus, SpawnPoint, ScanSpawnPoint,
                     SpawnpointDetectionData, LocationAltitude,
@@ -2475,6 +2515,8 @@ def database_migrate(db, old_ver):
                                 TextField(null=True, default=""))
         )
 
+
+ 
     if old_ver < 8:
         migrate(
             migrator.add_column('pokemon', 'individual_attack',
@@ -2532,7 +2574,10 @@ def database_migrate(db, old_ver):
                            'MODIFY COLUMN `gender` SMALLINT NULL DEFAULT NULL'
                            ';')
 
-    if old_ver < 16:
+	if old_ver < 16:
+        db.create_tables([PokestopDetails], safe=True)
+		
+    if old_ver < 17:
         log.info('This DB schema update can take some time. '
                  'Please be patient.')
 
